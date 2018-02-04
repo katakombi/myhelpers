@@ -1,0 +1,100 @@
+#!/bin/bash
+
+if [[ "$1" == "" ]]; then
+  echo "Playlist name expected"
+  exit 1
+fi
+
+LOGO_FN=~/.spotty_logo
+PLST_FN=~/.spotty
+SINK_NAME="record-n-play"
+WORK_DIR=~/Spotty/$1
+
+spottyd_start() {
+  touch $LOGO_FN $PLST_FN
+  dbus-monitor "type=method_call,member=Notify,interface=org.freedesktop.Notifications" 2>&1 |\
+  awk '
+    BEGIN{dump=0;width=300;height=300;stride=20;j=0;n=0}
+    /string "Spotify"/{dump=1}
+    /int32 -1/{
+      dump=0;
+      printf("P3 %i %i 255", width, height) > "'$LOGO_FN'"; 
+      n=0
+      for (m=0;m<j;m++) {
+      for (i=1;i<=stride;i++) {
+	if (n%stride==0) printf("\n") >>  "'$LOGO_FN'";
+	printf(" %d",strtonum("0x"vals[n])) >>"'$LOGO_FN'";
+	n++;
+      } }
+      system("");
+      n=0;
+    }
+    {
+      if (dump==4) {gsub("[[:space:]]*string[[:space:]]+\"",""); gsub("\"$",""); song=$0;}; 
+      if (dump==5) {gsub("[[:space:]]*string[[:space:]]+\"",""); gsub("\"$",""); artistAlbum=$0}; 
+      if (dump==5) {print song;print artistAlbum;print systime(); system("")}
+      if (dump) dump++;
+      if (NF==20) { for (i=1;i<=NF;i++) { vals[n]=$i; n++; }; j++; }
+    }' 2>&1 |\
+  cat >> $PLST_FN & 
+}
+
+spottyd_stop() {
+  kill %1
+}
+
+pa_setup() {
+  DEFAULT_OUTPUT=$(pacmd list-sinks | grep -A1 "* index" | grep -oP "<\K[^ >]+")
+  pactl load-module module-combine-sink sink_name=$SINK_NAME slaves=$DEFAULT_OUTPUT sink_properties=device.description="Record-and-Play" > /dev/null
+  SPOTIFY_INDEX=$(pacmd list-sink-inputs | awk '/index: / {ix=$2} /media.name = "Spotify"/ {print ix}')
+  if [[ "$SPOTIFY_INDEX" == "" ]]; then
+    echo "Error: apparently the spotify desktop client is not running yet."
+    echo "Start it and try again!"
+    exit 2
+  fi
+  pactl move-sink-input $SPOTIFY_INDEX $SINK_NAME
+}
+
+pa_cleanup() {
+  pactl list short modules | grep "sink_name=$SINK_NAME" | cut -f1 | xargs -L1 pactl unload-module
+}
+
+cleanup() {
+  echo -n "Cleaning up..."
+  spottyd_stop
+  pa_cleanup
+  rm -f $LOGO_FN
+  rm -f $PLST_FN
+  echo "done!"
+}
+
+trap "exit" INT TERM
+trap cleanup EXIT
+
+echo "Starting spotty daemon..."
+spottyd_start
+
+echo "Setting up pulse audio..."
+pa_setup
+
+mkdir -p $WORK_DIR
+
+echo "Waiting for Spotify to start playback..."
+
+inotifywait -qq -e modify $PLST_FN
+
+N=1
+while true; do
+  NSTR=$(echo "$N" | awk '{printf("%.3d\n",$1)}')
+  SONGFILENAME="${NSTR}) $(tail -n 3 $PLST_FN | awk 'FNR==1{print}')"
+  SONGTITLE="$(tail -n 3 $PLST_FN | awk 'FNR==1{print}')"
+  ARTIST="$(tail -n 3 $PLST_FN | awk 'FNR==2{print}')"
+  echo -n "Recording $SONGTITLE..."
+  parec --format=s16le -d record-n-play.monitor | lame -h --tt "$SONGTITLE" --ta "$ARTIST" -r --quiet -q 3 --lowpass 17 --abr 192 - "$WORK_DIR/$SONGFILENAME.mp3" > /dev/null &1>/dev/null &
+  inotifywait -qq -e modify $PLST_FN
+  killall lame parec # FIXME
+  cp $PLST_FN $WORK_DIR/playlist.txt
+  cp $LOGO_FN $WORK_DIR/${NSTR}-logo.ppm
+  echo "done!"
+  N=$((N + 1))
+done
